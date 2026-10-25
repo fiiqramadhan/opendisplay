@@ -1,0 +1,75 @@
+name: Build Mac sender for Ventura (Intel + Apple silicon)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch source for macOS 13 (Ventura)
+        run: |
+          set -e
+          # 1. Mac sender target 14.0 -> 13.0 (only the OpenSidecarMac target)
+          perl -0pi -e 's/(OpenSidecarMac:\n(?:[^\n]*\n){0,4}?\s*deploymentTarget: )"14\.0"/$1"13.0"/' project.yml
+          # 2. Class availability gate
+          perl -pi -e 's/\@available\(macOS 14\.0, \*\)/\@available(macOS 13.0, *)/' Mac/MacSender.swift
+          # 3. Zero-argument onChange closures are macOS 14-only
+          perl -pi -e 's/\{ controller\.restartAll\(\) \}/{ _ in controller.restartAll() }/g' Mac/OpenSidecarMacApp.swift
+          # 4. SCStreamFrameInfo.screenRect is macOS 13.1+: skip the wrong-display check below that
+          grep -q 'guard #available(macOS 13.1' Mac/MacSender.swift || \
+            perl -pi -e 's/(private func capturingAnotherDisplay\(_ sampleBuffer: CMSampleBuffer\) -> Bool \{\n)/$1        guard #available(macOS 13.1, *) else { return false }\n/' Mac/MacSender.swift
+          # 5. Text.foregroundStyle (returning Text) is macOS 14-only
+          perl -pi -e 's/\.foregroundStyle\(\.black\),/.foregroundColor(.black),/' Mac/TestPatternWindow.swift
+          echo "== patch check =="
+          grep -n 'deploymentTarget' project.yml | head -2
+          grep -n 'available(macOS 1' Mac/MacSender.swift | head
+          grep -n 'restartAll() }' Mac/OpenSidecarMacApp.swift
+          grep -n 'foregroundColor(.black)' Mac/TestPatternWindow.swift
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build OpenSidecarMac (deployment target 13.0, universal)
+        run: |
+          xcodebuild build \
+            -project OpenSidecar.xcodeproj \
+            -scheme OpenSidecarMac \
+            -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -derivedDataPath build \
+            ARCHS="x86_64 arm64" ONLY_ACTIVE_ARCH=NO \
+            MACOSX_DEPLOYMENT_TARGET=13.0 \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" DEVELOPMENT_TEAM="" \
+            > build.log 2>&1 || true
+          echo "== all errors =="
+          grep -E "error:" build.log | sort -u || true
+          tail -3 build.log
+          grep -q "BUILD SUCCEEDED" build.log
+
+      - name: Ad-hoc sign and zip
+        run: |
+          APP=$(ls -d build/Build/Products/Release/*.app | head -1)
+          echo "App: $APP"
+          lipo -info "$APP/Contents/MacOS/"*
+          codesign --force --deep --sign - \
+            --entitlements Mac/OpenSidecarMac.entitlements "$APP"
+          ditto -c -k --keepParent "$APP" OpenDisplay-Ventura.zip
+
+      - name: Upload app
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenDisplay-Ventura
+          path: OpenDisplay-Ventura.zip
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
